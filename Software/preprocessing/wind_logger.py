@@ -68,8 +68,8 @@ NEUTRAL_POSE = {               # 캐노피 면적 모드별 중립 자세 (J1, J
 # [수정 가능성 있음] 기종 미확정: XL330-M288-T 또는 XL430-W250-T.
 #   둘 다 0~4095, 0.088°/단위라 변환은 같다. 전원·무게·토크는 기종 확정 후 다시 확인.
 DXL_DEG_PER_TICK = 0.088       # Goal Position 1 단위 [deg]
-JOINT_ZERO_TICK = [[2048, 2048]] * 4  # 관절각 0°의 tick (리브별 J1, J2)
-JOINT_DIR_SIGN = [[1, 1]] * 4         # 관절 + 방향이 tick 증가면 1, 아니면 -1
+JOINT_ZERO_TICK = [[2048, 2048] for _ in range(4)]  # 관절각 0°의 tick (리브별 J1, J2)
+JOINT_DIR_SIGN = [[1, 1] for _ in range(4)]         # 관절 + 방향이 tick 증가면 1, 아니면 -1
 
 JOINT_COLUMNS = [f"r{i + 1}_j{k + 1}" for i in range(4) for k in range(2)]
 
@@ -83,21 +83,21 @@ def log_serial(port, baud=BAUD, out_dir=OUT_DIR, duration_s=None):
     import serial  # 분석만 할 때는 pyserial 없이도 동작하도록 여기서 import
 
     os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, dt.datetime.now().strftime("wind_%Y%m%d_%H%M%S.csv"))
+    path = os.path.join(out_dir, dt.datetime.now().strftime("wind_%Y%m%d_%H%M%S_%f.csv"))
 
     ser = serial.Serial(port, baud, timeout=1)
-    time.sleep(0.5)            # 포트 열 때 ESP32가 리셋될 수 있으니 잠깐 대기
-    ser.reset_input_buffer()
-    ser.write(b"h")            # 헤더 재요청 (리셋되지 않은 경우 대비)
 
     header = None
     n_rows = 0
-    t0 = time.time()
+    t0 = time.monotonic()
     print(f"[log] {port} → {path}  (Ctrl+C로 종료)")
     try:
-        with open(path, "w", newline="", encoding="utf-8") as fp:
+        time.sleep(0.5)
+        ser.reset_input_buffer()
+        ser.write(b"h")
+        with open(path, "x", newline="", encoding="utf-8") as fp:
             writer = csv.writer(fp)
-            while duration_s is None or time.time() - t0 < duration_s:
+            while duration_s is None or time.monotonic() - t0 < duration_s:
                 raw = ser.readline().decode("utf-8", errors="replace").strip()
                 if not raw:
                     continue
@@ -109,9 +109,21 @@ def log_serial(port, baud=BAUD, out_dir=OUT_DIR, duration_s=None):
                     if header is None:
                         header = fields
                         writer.writerow(header + LABEL_COLUMNS)
+                    elif fields != header:
+                        raise ValueError("수집 중 CSV 헤더가 변경되었습니다. 새 파일로 수집하세요.")
                     continue                         # 중복 헤더는 무시
                 if header is None or len(fields) != len(header):
                     continue                         # 헤더 전 데이터, 깨진 줄
+                try:
+                    for key, value in zip(header, fields):
+                        if key in ("vane_status", "sector_name", "mode"):
+                            continue
+                        if key in JOINT_COLUMNS and not value:
+                            continue  # 모터가 없는 관절의 빈 칸
+                        if not math.isfinite(float(value)):
+                            raise ValueError("nonfinite CSV value")
+                except ValueError:
+                    continue
                 writer.writerow(fields + [""] * len(LABEL_COLUMNS))
                 n_rows += 1
                 if n_rows % 25 == 0:                 # 5초마다 상태 표시
@@ -138,20 +150,25 @@ def load_csv(path):
 def error_report(df):
     """센서 오류 통계. 펌웨어 누적 카운터(10 Hz 기준)를 우선 쓰고, 없으면 CSV 행(5 Hz)으로 계산한다."""
     print("---- 센서 오류 ----")
-    if "err_events" in df and len(df):
-        last = df.iloc[-1]
-        span_ms = max(int(df["t_ms"].iloc[-1] - df["t_ms"].iloc[0]), 1)
-        print(f"오류 발생 {int(last['err_events'])}회, 누적 {int(last['err_total_ms']) / 1000:.1f} s "
-              f"(기록 시간의 {int(last['err_total_ms']) / span_ms:.1%}), 최장 {int(last['err_max_ms']) / 1000:.1f} s")
+    if all(c in df for c in ("err_events", "err_total_ms", "err_max_ms")) and len(df):
+        delta_t = df["t_ms"].diff()
+        delta_err = df["err_total_ms"].diff()
+        delta_events = df["err_events"].diff()
+        same_session = (delta_t > 0) & (delta_err >= 0) & (delta_events >= 0)
+        span_ms = delta_t[same_session].sum()
+        total_ms = delta_err[same_session].sum()
+        ratio = total_ms / span_ms if span_ms else 0.0
+        print(f"관측 구간 오류 발생 {int(delta_events[same_session].sum())}회, 누적 {total_ms / 1000:.1f} s "
+              f"(기록 시간의 {ratio:.1%}), 장치 누적 최장 {df['err_max_ms'].max() / 1000:.1f} s")
         if "sensor_fault" in df:
             print(f"센서 고장(추적 중단) 상태 비율: {df['sensor_fault'].mean():.1%}")
         # ESP32가 재부팅되면 카운터가 0으로 돌아가므로 감소 지점을 알려준다
-        resets = int((df["err_events"].diff() < 0).sum())
+        resets = int(((delta_t < 0) | (delta_err < 0) | (delta_events < 0)).sum())
         if resets:
-            print(f"※ 카운터 초기화 {resets}회 감지 (ESP32 재부팅) — 위 값은 마지막 부팅 이후 기준")
+            print(f"※ 시간/카운터 초기화 {resets}회 감지 — 경계를 가로지르는 구간은 통계에서 제외")
     # CSV 행 기준 구간 목록 (5 Hz라 0.2 s 미만 오류는 빠질 수 있음)
     bad = df["valid"] != 1
-    seg_id = (bad != bad.shift()).cumsum()
+    seg_id = ((bad != bad.shift()) | (df["t_ms"].diff() < 0)).cumsum()
     segs = [(g["t_ms"].iloc[0], g["t_ms"].iloc[-1], g["vane_status"].mode().iloc[0])
             for _, g in df[bad].groupby(seg_id[bad])]
     print(f"CSV상 오류 구간 {len(segs)}개", "(상태별 행 수: " + str(df.loc[bad, "vane_status"].value_counts().to_dict()) + ")")
@@ -186,7 +203,9 @@ def plot_direction_hist(df, col="dir_rel_deg", ax=None):
     """16방향 풍향 분포 (극좌표, 정면 0° 위쪽, 시계방향)."""
     import matplotlib.pyplot as plt
 
-    idx = np.round(df[col].to_numpy() / 22.5).astype(int) % 16
+    values = df[col].to_numpy(dtype=float)
+    values = values[np.isfinite(values)]
+    idx = np.floor((values % 360 + 11.25) / 22.5).astype(int) % 16
     counts = np.bincount(idx, minlength=16)
     if ax is None:
         _, ax = plt.subplots(subplot_kw={"projection": "polar"}, figsize=(5, 5))
@@ -203,6 +222,8 @@ def plot_speed(df, ax=None):
 
     if ax is None:
         _, ax = plt.subplots(figsize=(10, 4))
+    if df.empty:
+        return ax
     t = (df["t_ms"] - df["t_ms"].iloc[0]) / 1000.0
     ax.plot(t, df["speed_inst_ms"], lw=0.7, alpha=0.5, label="순간")
     ax.plot(t, df["speed_avg_ms"], lw=1.6, label="평균")
@@ -225,10 +246,11 @@ def build_features(df, require_direction_valid=False):
     d = df[df["valid"] == 1]
     if require_direction_valid:
         d = d[d["direction_valid"] == 1]
+    d = d[np.isfinite(d[FEATURE_COLUMNS].to_numpy(dtype=float)).all(axis=1)]
     X = d[FEATURE_COLUMNS].to_numpy(dtype=float)
     y = None
     if all(c in d for c in LABEL_COLUMNS):
-        lab = d[LABEL_COLUMNS].dropna()
+        lab = d[LABEL_COLUMNS].replace([np.inf, -np.inf], np.nan).dropna()
         if len(lab):
             X = d.loc[lab.index, FEATURE_COLUMNS].to_numpy(dtype=float)
             y = lab.to_numpy(dtype=float)
@@ -270,6 +292,7 @@ def map_rib_targets(tilt_dir_deg, tilt_deg, direction_valid=True, mode="WIDE", s
     (데드밴드·속도 제한은 상태가 필요하므로 펌웨어 JointLimiter 에서 처리)
     """
     n1, n2 = NEUTRAL_POSE[mode]
+    direction_valid = direction_valid and math.isfinite(tilt_dir_deg) and math.isfinite(tilt_deg)
     s = min(max(tilt_deg / TILT_MAX_DEG, 0.0), 1.0)
     out = {}
     for i, rib in enumerate(RIB_ANGLE_DEG):
@@ -300,8 +323,8 @@ def deg_to_dxl_tick(rib, joint, deg):
 
 def add_joint_columns(df, dir_col="target_tilt_dir_deg", tilt_col="target_tilt_deg", prefix="pred_"):
     """df 각 행의 (방향, 크기)로 8관절 목표각 컬럼을 계산해 붙인다."""
-    rows = [map_rib_targets(r[dir_col], r[tilt_col], bool(r["direction_valid"]),
-                            r.get("mode", "WIDE"), bool(r.get("safe_mode", 0)))
+    rows = [map_rib_targets(r[dir_col], r[tilt_col], r["direction_valid"] == 1,
+                            r.get("mode", "WIDE"), r.get("pose_safe", r.get("safe_mode", 0)) == 1)
             for _, r in df.iterrows()]
     joints = pd.DataFrame(rows, index=df.index).add_prefix(prefix)
     return pd.concat([df, joints], axis=1)

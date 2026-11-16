@@ -59,7 +59,7 @@ constexpr float VANE_VCC_MV       = 3300.0f;  // 분배 전원 전압 [mV] (멀�
 //   가운데로 둔다. 단락 실측 142mV 기준이면 (142+212)/2 ≈ 177 → 180 유지.
 //   112.5° 위치 실측값이 200mV 이하로 나오면 여유가 줄어드니 그 값으로 다시 계산할 것.
 constexpr int   VANE_SHORT_MV     = 180;      // 이 값 미만 = 단락 [mV] (ESP32 ADC는 0V를 약 140mV로 읽음)
-constexpr int   VANE_OPEN_MV      = 3150;     // 이 값 초과 = 미연결 [mV]
+constexpr int   VANE_OPEN_MV      = 3100;     // ADC 측정 상한 이상은 미연결/포화 (실측 보정 필요)
 constexpr float VANE_MAX_LOG_ERR  = 0.20f;    // |ln(R측정/R테이블)| 허용치 (0.20 ≈ ±20%), 초과 시 무효
 constexpr int   VANE_OVERSAMPLE   = 4;        // 1회 샘플당 ADC 평균 횟수 (전압끼리 평균, 각도 평균 아님)
 // 풍향 오류 처리 단계
@@ -267,13 +267,15 @@ portMUX_TYPE g_anemoMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint32_t g_pulseCount      = 0; // 누적 펄스 수
 volatile uint32_t g_lastPulseUs     = 0; // 마지막 유효 펄스 시각 [us]
 volatile uint32_t g_pulseIntervalUs = 0; // 직전 두 펄스 간격 [us] (0 = 아직 없음)
+volatile bool g_havePulse = false;
 
 void IRAM_ATTR onAnemoPulse() {
   uint32_t now = micros();
   portENTER_CRITICAL_ISR(&g_anemoMux);
   uint32_t dt = now - g_lastPulseUs;
-  if (g_pulseCount == 0 || dt >= ANEMO_DEBOUNCE_US) {
-    if (g_pulseCount > 0) g_pulseIntervalUs = dt;
+  if (!g_havePulse || dt >= ANEMO_DEBOUNCE_US) {
+    g_pulseIntervalUs = (g_havePulse && dt <= ANEMO_TIMEOUT_MS * 1000UL) ? dt : 0;
+    g_havePulse = true;
     g_lastPulseUs = now;
     g_pulseCount = g_pulseCount + 1;
   }
@@ -300,7 +302,7 @@ float angDiff(float a, float b) {
 VaneReading decodeVane(int mv) {
   VaneReading r = {VANE_OK, mv, 0.0f, -1, 0.0f, 0.0f};
   if (mv < VANE_SHORT_MV) { r.status = VANE_SHORT; r.r_ohm = 0.0f;  return r; }
-  if (mv > VANE_OPEN_MV)  { r.status = VANE_OPEN;  r.r_ohm = -1.0f; return r; }
+  if (mv >= VANE_OPEN_MV || mv >= VANE_VCC_MV) { r.status = VANE_OPEN; r.r_ohm = -1.0f; return r; }
 
   // 분배식 V = Vcc · R / (R + Rpullup)  →  R = Rpullup · V / (Vcc − V)
   r.r_ohm = VANE_R_PULLUP_OHM * mv / (VANE_VCC_MV - mv);
@@ -463,6 +465,11 @@ int readVaneMv() {
 
 void anemoSnapshot(uint32_t& count, uint32_t& lastUs, uint32_t& intervalUs) {
   portENTER_CRITICAL(&g_anemoMux);
+  // 만료된 간격을 지워 micros() 순환(약 71분) 후 과거 풍속이 부활하지 않게 한다.
+  if (g_havePulse && (uint32_t)(micros() - g_lastPulseUs) > ANEMO_TIMEOUT_MS * 1000UL) {
+    g_havePulse = false;
+    g_pulseIntervalUs = 0;
+  }
   count = g_pulseCount; lastUs = g_lastPulseUs; intervalUs = g_pulseIntervalUs;
   portEXIT_CRITICAL(&g_anemoMux);
 }
@@ -478,7 +485,7 @@ void processSample(uint32_t nowMs) {
   anemoSnapshot(cnt, lastUs, intUs);
   uint32_t nowUs = micros();
   uint32_t sinceUs = nowUs - lastUs;
-  if (cnt < 2 || intUs == 0 || sinceUs > ANEMO_TIMEOUT_MS * 1000UL) {
+  if (intUs == 0 || sinceUs > ANEMO_TIMEOUT_MS * 1000UL) {
     f.speed_inst_ms = 0.0f;
   } else {
     // 마지막 펄스 이후 경과시간이 직전 간격보다 길면 그만큼 느려진 것으로 본다 (부드러운 감쇠)
@@ -523,10 +530,17 @@ void processSample(uint32_t nowMs) {
   f.sensor_fault = !f.valid && f.err_cur_ms > VANE_FAULT_TIMEOUT_MS;
   bool vaneFresh = s.everValid && !f.sensor_fault;
 
+  // 고장 중 가상의 일정 방향을 누적하지 않고, 복구 시 새 측정으로 시작한다.
+  if (!vaneFresh) {
+    for (int i = 0; i < AVG_N; i++) { s.bufU[i] = 0; s.bufW[i] = 0; }
+    s.emaU = s.emaW = 0;
+  }
+
   // ---- 풍속 가중 벡터 ----
   float v  = f.speed_inst_ms;
   float th = f.dir_from_rel_deg * DEG2RAD;
-  float u = v * sinf(th), w = v * cosf(th);
+  float u = vaneFresh ? v * sinf(th) : 0.0f;
+  float w = vaneFresh ? v * cosf(th) : 0.0f;
 
   float uA, wA, vA;
   if (SMOOTH_USE_EMA) {
@@ -584,7 +598,7 @@ void processSample(uint32_t nowMs) {
   f.tilt_dir_deg = s.lastTiltDir;   // 무효 동안은 마지막 방향 유지 (크기는 0)
 
   // ---- 강풍 모드 ----
-  float wmax = max(vA, g);
+  float wmax = max(v, max(vA, g)); // 급격한 강풍은 평균창을 기다리지 않고 진입
   if (!s.safe) {
     if (wmax > WIND_SAFE_LIMIT_MS) { s.safe = true; s.safeReleasing = false; }
   } else if (wmax < WIND_SAFE_LIMIT_MS - WIND_SAFE_HYST_MS) {
@@ -614,7 +628,7 @@ void printHeader() {
     "speed_inst_ms,speed_win_ms,speed_avg_ms,gust_ms,u,w,dir_avg_deg,sin_dir,cos_dir,"
     "stability_R,direction_valid,protect_sector,sector_name,tilt_dir_deg,tilt_deg_baseline,"
     "mode,safe_mode,sensor_fault,err_events,err_samples,err_total_ms,err_cur_ms,err_max_ms,"
-    "r1_j1,r1_j2,r2_j1,r2_j2,r3_j1,r3_j2,r4_j1,r4_j2");
+    "r1_j1,r1_j2,r2_j1,r2_j2,r3_j1,r3_j2,r4_j1,r4_j2,pose_safe");
 }
 
 void printCsv(const WindFeatures& f, const RibTargets& r) {
@@ -640,7 +654,8 @@ void printCsv(const WindFeatures& f, const RibTargets& r) {
       else                     n += snprintf(buf + n, sizeof(buf) - n, ",");   // 모터 없는 관절 = 빈 칸
     }
   }
-  Serial.println(buf);
+  Serial.print(buf);
+  Serial.printf(",%d\n", (f.safe_mode || (f.sensor_fault && FAULT_ACTION == FAULT_TO_SAFE)) ? 1 : 0);
 }
 
 // ============================================================================
@@ -669,6 +684,17 @@ void selfTest() {
   Serial.printf("# TEST decode(100mV)=%s, decode(142mV)=%s, decode(3250mV)=%s\n",
                 VANE_STATUS_NAME[decodeVane(100).status], VANE_STATUS_NAME[decodeVane(142).status],
                 VANE_STATUS_NAME[decodeVane(3250).status]);
+  { bool ok = decodeVane(VANE_OPEN_MV).status == VANE_OPEN &&
+              decodeVane((int)VANE_VCC_MV).status == VANE_OPEN;
+    Serial.printf("# TEST ADC saturation guards -> %s\n", ok ? "PASS" : "FAIL"); }
+  { bool ok = true;
+    for (int k = 0; k < 16; k++) {
+      int expected = ((k + 1) / 2) % 8;
+      ok = ok && sectorFromDir(k * 22.5f, SECTOR_NONE) == expected;
+    }
+    ok = ok && sectorFromDir(27.0f, 0) == 0 && sectorFromDir(28.0f, 0) == 1 &&
+         sectorFromDir(359.0f, 0) == 0;
+    Serial.printf("# TEST 16-to-8 sectors / hysteresis -> %s\n", ok ? "PASS" : "FAIL"); }
   // 8방향 × 최대 기울기에서 관절 목표각 표 (Python selftest 표와 같아야 함)
   Serial.println("# TEST map8  dir  sector  r1_j1 r1_j2 r2_j1 r2_j2 r3_j1 r3_j2 r4_j1 r4_j2");
   for (int k = 0; k < 8; k++) {
